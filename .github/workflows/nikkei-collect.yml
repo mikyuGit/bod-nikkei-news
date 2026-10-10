@@ -113,6 +113,7 @@ jobs:
           def deliver_rss(body, collected_at, token, worker_url):
               headers = {"Authorization": "Bearer " + token,
                          "Content-Type": "application/rss+xml; charset=utf-8",
+                         "User-Agent": "BoD-Nikkei-Collector/1.7 (+https://github.com/mikyuGit/bod-nikkei-news)",
                          "X-BoD-Collected-At": collected_at}
               if os.environ.get("BOD_TEST_POST", "false").lower() == "true":
                   headers["X-BoD-Test-Post"] = "true"
@@ -139,7 +140,7 @@ jobs:
                           data = json.loads(raw)
                           message = str(data.get("error", "Request rejected"))[:300]
                       except (ValueError, AttributeError):
-                          message = "Non-JSON error response"
+                          message = "Non-JSON error response: " + raw.decode("utf-8", errors="replace")[:500]
                       raise ValueError("Worker HTTP " + str(error.code) + ": " + message) from None
           
           def main():
