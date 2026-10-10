@@ -1,0 +1,102 @@
+name: Nikkei RSS access probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/nikkei-probe.yml]
+
+permissions: {}
+
+concurrency:
+  group: nikkei-rss-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fetch Google News RSS once
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          
+          MAX_BYTES = 256 * 1024
+          QUERY = "site:nikkei.com/article/ when:6h"
+          URL = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+              {"q": QUERY, "hl": "ja", "gl": "JP", "ceid": "JP:ja"}
+          )
+          
+          class GoogleRedirects(urllib.request.HTTPRedirectHandler):
+              max_redirections = 3
+          
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  target = urllib.parse.urlsplit(newurl)
+                  if target.scheme != "https" or target.hostname != "news.google.com":
+                      raise ValueError("Unexpected redirect; stopping.")
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+          
+          def inspect_rss(body):
+              if len(body) > MAX_BYTES:
+                  raise ValueError("RSS exceeds the size limit.")
+              if b"<!DOCTYPE" in body.upper() or b"<!ENTITY" in body.upper():
+                  raise ValueError("Unexpected XML declaration.")
+              root = ET.fromstring(body)
+              channel = root.find("channel")
+              if root.tag != "rss" or channel is None:
+                  raise ValueError("The response is not an RSS channel.")
+              items = channel.findall("item")
+              if len(items) > 120:
+                  raise ValueError("Unexpected RSS item count.")
+              verified = 0
+              japanese = 0
+              for item in items:
+                  source = item.find("source")
+                  if source is None:
+                      continue
+                  publisher = urllib.parse.urlsplit(source.get("url", ""))
+                  if publisher.scheme not in ("http", "https") or publisher.hostname not in ("nikkei.com", "www.nikkei.com"):
+                      continue
+                  title = item.findtext("title", "").strip()
+                  link = urllib.parse.urlsplit(item.findtext("link", "").strip())
+                  if not title or link.scheme != "https" or link.hostname not in ("news.google.com", "nikkei.com", "www.nikkei.com"):
+                      continue
+                  verified += 1
+                  if any("\u3040" <= char <= "\u30ff" or "\u4e00" <= char <= "\u9fff" for char in title):
+                      japanese += 1
+              if items and not verified:
+                  raise ValueError("RSS contains no verified Nikkei entries.")
+              return {"rss_items": len(items), "verified_nikkei_items": verified, "japanese_items": japanese}
+          
+          def main():
+              report = {"checked_at": datetime.now(timezone.utc).isoformat(), "query": QUERY,
+                        "diagnostic_only": True, "discord_posted": False}
+              request = urllib.request.Request(URL, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
+              opener = urllib.request.build_opener(GoogleRedirects())
+              try:
+                  with opener.open(request, timeout=25) as response:
+                      report["http_status"] = response.status
+                      report["content_type"] = response.headers.get("Content-Type", "")
+                      report.update(inspect_rss(response.read(MAX_BYTES + 1)))
+                  report["ok"] = True
+              except urllib.error.HTTPError as error:
+                  body = error.read(32 * 1024)
+                  report.update(ok=False, http_status=error.code,
+                                retry_after=error.headers.get("Retry-After"),
+                                automated_query_block=b"automated queries" in body.lower())
+              except (urllib.error.URLError, ValueError, ET.ParseError, TimeoutError, OSError) as error:
+                  report.update(ok=False, error=str(error)[:400])
+              print(json.dumps(report, ensure_ascii=False, indent=2))
+              return 0 if report["ok"] else 1
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
