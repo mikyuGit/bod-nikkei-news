@@ -1,0 +1,169 @@
+name: Nikkei Japanese market news
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_post:
+        description: "Post one clearly labelled test card to Discord"
+        type: boolean
+        default: false
+  schedule:
+    - cron: '2-59/5 * * * *'
+  push:
+    branches: [main]
+    paths: [.github/workflows/nikkei-collect.yml]
+
+permissions:
+  id-token: write
+
+concurrency:
+  group: nikkei-google-news-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      BOD_WORKER_URL: https://discord-jgb-auction-bot.mikyu38.workers.dev
+      BOD_TEST_POST: ${{ inputs.test_post && 'true' || 'false' }}
+    steps:
+      - name: Fetch and hand off Nikkei RSS
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          
+          MAX_BYTES = 256 * 1024
+          QUERY = "site:nikkei.com/article/ when:6h"
+          URL = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+              {"q": QUERY, "hl": "ja", "gl": "JP", "ceid": "JP:ja"}
+          )
+          
+          class GoogleRedirects(urllib.request.HTTPRedirectHandler):
+              max_redirections = 3
+          
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  target = urllib.parse.urlsplit(newurl)
+                  if target.scheme != "https" or target.hostname != "news.google.com":
+                      raise ValueError("Unexpected redirect; stopping.")
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+          
+          def inspect_rss(body):
+              if len(body) > MAX_BYTES:
+                  raise ValueError("RSS exceeds the size limit.")
+              if b"<!DOCTYPE" in body.upper() or b"<!ENTITY" in body.upper():
+                  raise ValueError("Unexpected XML declaration.")
+              root = ET.fromstring(body)
+              channel = root.find("channel")
+              if root.tag != "rss" or channel is None:
+                  raise ValueError("The response is not an RSS channel.")
+              items = channel.findall("item")
+              if len(items) > 120:
+                  raise ValueError("Unexpected RSS item count.")
+              verified = 0
+              japanese = 0
+              for item in items:
+                  source = item.find("source")
+                  if source is None:
+                      continue
+                  publisher = urllib.parse.urlsplit(source.get("url", ""))
+                  if publisher.scheme not in ("http", "https") or publisher.hostname not in ("nikkei.com", "www.nikkei.com"):
+                      continue
+                  title = item.findtext("title", "").strip()
+                  link = urllib.parse.urlsplit(item.findtext("link", "").strip())
+                  if not title or link.scheme != "https" or link.hostname not in ("news.google.com", "nikkei.com", "www.nikkei.com"):
+                      continue
+                  verified += 1
+                  if any("\u3040" <= char <= "\u30ff" or "\u4e00" <= char <= "\u9fff" for char in title):
+                      japanese += 1
+              if items and not verified:
+                  raise ValueError("RSS contains no verified Nikkei entries.")
+              return {"rss_items": len(items), "verified_nikkei_items": verified, "japanese_items": japanese}
+          
+          class NoRedirects(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise ValueError("Unexpected redirect; stopping.")
+          
+          def get_identity(audience):
+              target = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+              parsed = urllib.parse.urlsplit(target)
+              if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".actions.githubusercontent.com"):
+                  raise ValueError("The GitHub identity endpoint is invalid.")
+              target += ("&" if parsed.query else "?") + urllib.parse.urlencode({"audience": audience})
+              request = urllib.request.Request(target, headers={
+                  "Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"],
+                  "Accept": "application/json",
+              })
+              with urllib.request.build_opener(NoRedirects()).open(request, timeout=20) as response:
+                  data = json.loads(response.read(64 * 1024))
+              value = data.get("value", "")
+              if not isinstance(value, str) or len(value) > 18000 or value.count(".") != 2:
+                  raise ValueError("GitHub did not return a valid identity token.")
+              return value
+          
+          def deliver_rss(body, collected_at, token, worker_url):
+              headers = {"Authorization": "Bearer " + token,
+                         "Content-Type": "application/rss+xml; charset=utf-8",
+                         "X-BoD-Collected-At": collected_at}
+              if os.environ.get("BOD_TEST_POST", "false").lower() == "true":
+                  headers["X-BoD-Test-Post"] = "true"
+              opener = urllib.request.build_opener(NoRedirects())
+              for attempt in range(2):
+                  request = urllib.request.Request(worker_url, data=body, headers=headers, method="POST")
+                  try:
+                      with opener.open(request, timeout=30) as response:
+                          result = json.loads(response.read(64 * 1024))
+                      if not result.get("ok"):
+                          raise ValueError("Worker did not accept this feed.")
+                      return result
+                  except urllib.error.HTTPError as error:
+                      raw = error.read(32 * 1024)
+                      if attempt == 0 and error.code in (429, 500, 502, 503, 504):
+                          try:
+                              wait = int(error.headers.get("Retry-After", "30"))
+                          except ValueError:
+                              wait = 30
+                          if wait <= 30:
+                              time.sleep(max(1, wait))
+                              continue
+                      try:
+                          data = json.loads(raw)
+                          message = str(data.get("error", "Request rejected"))[:300]
+                      except (ValueError, AttributeError):
+                          message = "Non-JSON error response"
+                      raise ValueError("Worker HTTP " + str(error.code) + ": " + message) from None
+          
+          def main():
+              report = {"checked_at": datetime.now(timezone.utc).isoformat(), "query": QUERY}
+              try:
+                  request = urllib.request.Request(URL, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
+                  with urllib.request.build_opener(GoogleRedirects()).open(request, timeout=25) as response:
+                      report["google_http_status"] = response.status
+                      body = response.read(MAX_BYTES + 1)
+                  report.update(inspect_rss(body))
+                  collected_at = datetime.now(timezone.utc).isoformat()
+                  worker_url = os.environ["BOD_WORKER_URL"].rstrip("/") + "/news/ingest/nikkei"
+                  if worker_url != "https://discord-jgb-auction-bot.mikyu38.workers.dev/news/ingest/nikkei":
+                      raise ValueError("Unexpected Worker URL.")
+                  identity = get_identity(worker_url)
+                  report["worker"] = deliver_rss(body, collected_at, identity, worker_url)
+                  report["ok"] = True
+              except urllib.error.HTTPError as error:
+                  report.update(ok=False, error="Upstream HTTP " + str(error.code))
+              except (urllib.error.URLError, ValueError, ET.ParseError, TimeoutError, OSError, KeyError) as error:
+                  report.update(ok=False, error=str(error)[:400])
+              print(json.dumps(report, ensure_ascii=False, indent=2))
+              return 0 if report["ok"] else 1
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
