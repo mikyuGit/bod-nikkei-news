@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '2-59/5 * * * *'
+    - cron: '3-59/5 * * * *'
   push:
     branches: [main]
     paths: [.github/workflows/nikkei-collect.yml]
@@ -23,7 +23,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     env:
       BOD_WORKER_URL: https://discord-jgb-auction-bot.mikyu38.workers.dev
       BOD_TEST_POST: ${{ inputs.test_post && 'true' || 'false' }}
@@ -147,9 +147,23 @@ jobs:
               report = {"checked_at": datetime.now(timezone.utc).isoformat(), "query": QUERY}
               try:
                   request = urllib.request.Request(URL, headers={"Accept": "application/rss+xml, application/xml, text/xml"})
-                  with urllib.request.build_opener(GoogleRedirects()).open(request, timeout=25) as response:
-                      report["google_http_status"] = response.status
-                      body = response.read(MAX_BYTES + 1)
+                  # Retry transient upstream failures; authentication and feed validation still fail closed.
+                  for google_attempt in range(3):
+                      try:
+                          with urllib.request.build_opener(GoogleRedirects()).open(request, timeout=20) as response:
+                              report["google_http_status"] = response.status
+                              body = response.read(MAX_BYTES + 1)
+                          report["google_attempts"] = google_attempt + 1
+                          break
+                      except urllib.error.HTTPError as error:
+                          retryable = error.code in (429, 500, 502, 503, 504)
+                          error.close()
+                          if not retryable or google_attempt == 2:
+                              raise
+                      except (urllib.error.URLError, TimeoutError, OSError):
+                          if google_attempt == 2:
+                              raise
+                      time.sleep(5 * (google_attempt + 1))
                   report.update(inspect_rss(body))
                   collected_at = datetime.now(timezone.utc).isoformat()
                   worker_url = os.environ["BOD_WORKER_URL"].rstrip("/") + "/news/ingest/nikkei"
