@@ -163,7 +163,7 @@ jobs:
                       except (urllib.error.URLError, TimeoutError, OSError):
                           if google_attempt == 2:
                               raise
-                      time.sleep(5 * (google_attempt + 1))
+                      time.sleep(10 * (google_attempt + 1))
                   report.update(inspect_rss(body))
                   collected_at = datetime.now(timezone.utc).isoformat()
                   worker_url = os.environ["BOD_WORKER_URL"].rstrip("/") + "/news/ingest/nikkei"
